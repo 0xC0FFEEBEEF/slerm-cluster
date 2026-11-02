@@ -1,0 +1,6 @@
+# 2026-10-13 (user asked, "have it downloaded/configured, no testing"): ISTA-DASLab cut-down Qwen3.8-Flash-Next
+# "Coder" build (GSQ-RCO, 256 of 512 experts kept, 3.5 bpw). Two shards, both needed; llama.cpp loads the pair when
+# given the first. Shard 1 = transformer (29.6 GB, must be in memory), shard 2 = n-gram lookup table (28.8 GB).
+ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF|mmproj-Qwen3.8-Flash-Next-BF16.gguf|qwen3.8-flash-next-coder/mmproj-qwen3.8-flash-next-bf16.gguf|0
+ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF|IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf|qwen3.8-flash-next-coder/qwen3.8-flash-next-coder-00001-of-00002.gguf|0
+ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF|IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf|qwen3.8-flash-next-coder/qwen3.8-flash-next-coder-00002-of-00002.gguf|0

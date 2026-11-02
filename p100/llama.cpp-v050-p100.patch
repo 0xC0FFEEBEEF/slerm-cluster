@@ -1,0 +1,990 @@
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index 06dea1e..3c25bdf 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -127,7 +127,9 @@ struct common_sampler {
+         llama_sampler_reset(chain);
+     }
+ 
+-    void set_logits(struct llama_context * ctx, int idx) {
++    // topk > 0: the chain is known to keep only the top-k candidates (common_sampler_prefilter_k), so pick exactly
++    // those in one pass over the logits instead of filling all n_vocab entries and partially sorting them
++    void set_logits(struct llama_context * ctx, int idx, int topk = 0) {
+         const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
+         const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
+         const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
+@@ -152,6 +154,30 @@ struct common_sampler {
+         } else {
+             const auto * logits = llama_get_logits_ith(ctx, idx);
+             GGML_ASSERT(logits != nullptr);
++            if (topk > 0 && topk < n_vocab) {
++                cur.resize(topk);
++                for (int i = 0; i < topk; i++) {
++                    cur[i] = llama_token_data{i, logits[i], 0.0f};
++                }
++                std::sort(cur.begin(), cur.end(), [](const llama_token_data & a, const llama_token_data & b) {
++                    return a.logit > b.logit;
++                });
++                float floor = cur[topk - 1].logit;
++                for (llama_token token_id = topk; token_id < n_vocab; token_id++) {
++                    const float l = logits[token_id];
++                    if (l > floor) {
++                        int j = topk - 1;
++                        while (j > 0 && cur[j - 1].logit < l) {
++                            cur[j] = cur[j - 1];
++                            j--;
++                        }
++                        cur[j] = llama_token_data{token_id, l, 0.0f};
++                        floor  = cur[topk - 1].logit;
++                    }
++                }
++                cur_p = { cur.data(), cur.size(), -1, true };
++                return;
++            }
+             cur.resize(n_vocab);
+             for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+                 cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
+@@ -591,6 +617,45 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
+     return gsmpl->chain;
+ }
+ 
++// 2026-10-08 P100 work: when nothing ahead of top-k in the chain can change a logit (no logit bias or suppressed
++// tokens, neutral penalties / DRY / top-n-sigma, no mirostat), the chain only ever sees the top-k candidates.
++// Returns that k, or 0 for the full path.
++static int common_sampler_prefilter_k(const common_sampler * gsmpl, const llama_vocab * vocab) {
++    const auto & p = gsmpl->params;
++    if (p.mirostat != 0 || p.top_k <= 0 || !p.logit_bias.empty()) {
++        return 0;
++    }
++    int32_t n_suppress = 0;
++    llama_vocab_get_suppress_tokens(vocab, &n_suppress);
++    if (n_suppress > 0) {
++        return 0;
++    }
++    for (const auto t : p.samplers) {
++        switch (t) {
++            case COMMON_SAMPLER_TYPE_TOP_K:
++                return p.top_k;
++            case COMMON_SAMPLER_TYPE_PENALTIES:
++                if (!(p.penalty_last_n == 0 || (p.penalty_repeat == 1.0f && p.penalty_freq == 0.0f && p.penalty_present == 0.0f))) {
++                    return 0;
++                }
++                break;
++            case COMMON_SAMPLER_TYPE_DRY:
++                if (!(p.dry_multiplier == 0.0f || p.dry_base < 1.0f || p.dry_penalty_last_n == 0)) {
++                    return 0;
++                }
++                break;
++            case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
++                if (p.top_n_sigma > 0.0f) {
++                    return 0;
++                }
++                break;
++            default:
++                return 0;
++        }
++    }
++    return 0;
++}
++
+ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
+     llama_synchronize(ctx);
+ 
+@@ -604,7 +669,13 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+     auto & chain = gsmpl->chain;
+     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
+ 
+-    gsmpl->set_logits(ctx, idx);
++    {
++        // full path while the reasoning budget is forcing (it rewrites every logit) or the grammar goes first
++        const bool rb_forcing = rbudget && common_reasoning_budget_get_state(rbudget) == REASONING_BUDGET_FORCING;
++        const int  topk = rb_forcing || (grammar_first && grammar_should_apply(gsmpl)) ? 0 :
++            common_sampler_prefilter_k(gsmpl, llama_model_get_vocab(llama_get_model(ctx)));
++        gsmpl->set_logits(ctx, idx, topk);
++    }
+ 
+     // Check if a backend sampler has already sampled a token in which case we
+     // return that token id directly.
+diff --git a/ggml/src/ggml-cuda/allreduce.cu b/ggml/src/ggml-cuda/allreduce.cu
+index 39b23be..cc340b4 100644
+--- a/ggml/src/ggml-cuda/allreduce.cu
++++ b/ggml/src/ggml-cuda/allreduce.cu
+@@ -1,4 +1,6 @@
++#include "p100-prof.cuh"
+ #include "allreduce.cuh"
++#include "p100-tune.cuh"
+ 
+ #if !defined(GGML_USE_MUSA)
+ 
+@@ -167,6 +169,8 @@ static __global__ void ggml_cuda_ar_kernel(
+             __builtin_amdgcn_s_sleep(4);
+ #elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+             __nanosleep(100);
++#elif defined(__CUDA_ARCH__)
++            // Pascal has no __nanosleep. Each poll is an uncached read of host memory over PCIe, which paces the loop.
+ #else
+             NO_DEVICE_CODE;
+ #endif // GGML_USE_HIP
+@@ -406,10 +410,11 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
+     }
+ 
+     // The chunked kernel uses __nanosleep (NVIDIA, sm70+) or
+-    // __builtin_amdgcn_s_sleep (AMD).
++    // __builtin_amdgcn_s_sleep (AMD). GGML_CUDA_AR_PASCAL=1 allows Pascal, which spins without it.
++    static const bool ar_pascal = getenv("GGML_CUDA_AR_PASCAL") != nullptr && atoi(getenv("GGML_CUDA_AR_PASCAL"));
+     for (size_t i = 0; i < n_devices; ++i) {
+         const int cc = ggml_cuda_info().devices[devices[i]].cc;
+-        if (cc < GGML_CUDA_CC_VOLTA) {
++        if (cc < GGML_CUDA_CC_VOLTA && !((ar_pascal || ggml_cuda_tune_file_active()) && cc >= GGML_CUDA_CC_PASCAL)) {
+             GGML_LOG_DEBUG("%s: internal AllReduce requires compute capability >= %d "
+                            "(device %d has cc=%d); falling back\n",
+                            __func__, GGML_CUDA_CC_VOLTA, devices[i], cc);
+@@ -745,7 +750,7 @@ static bool ggml_cuda_ar_allreduce_copy_outer(
+     return ok;
+ }
+ 
+-bool ggml_cuda_ar_allreduce(
++static bool ggml_cuda_ar_allreduce_impl(
+         ggml_cuda_ar_pipeline * p,
+         ggml_backend_t        * backends,
+         ggml_tensor           ** tensors) {
+@@ -766,10 +771,11 @@ bool ggml_cuda_ar_allreduce(
+     // the reduction (chunked or copy-engine), halving on-wire bytes. Matches
+     // NCCL's behaviour. The pre-conversion zeroes inactive shards so the
+     // inner paths see them as already-prepared compute tensors.
++    const size_t bf16_threshold = ggml_cuda_tune.ar_bf16 >= 0 ? (size_t) ggml_cuda_tune.ar_bf16 : p->bf16_threshold;
+     const bool use_bf16 =
+         input_type == GGML_TYPE_F32 &&
+-        p->bf16_threshold > 0 &&
+-        input_nbytes >= p->bf16_threshold;
++        bf16_threshold > 0 &&
++        input_nbytes >= bf16_threshold;
+ 
+     const ggml_type kernel_type = use_bf16 ? GGML_TYPE_BF16 : input_type;
+     const size_t    type_size   = ggml_type_size(kernel_type);
+@@ -957,6 +963,23 @@ bool ggml_cuda_ar_allreduce(
+     return ok;
+ }
+ 
++// PROF=N timing (p100-prof.cuh): mark each device's compute stream around the whole AllReduce, both paths.
++bool ggml_cuda_ar_allreduce(ggml_cuda_ar_pipeline * p, ggml_backend_t * backends, ggml_tensor ** tensors) {
++    if (!ggml_cuda_prof_live) {
++        return ggml_cuda_ar_allreduce_impl(p, backends, tensors);
++    }
++    for (int i = 0; i < p->n_devices; ++i) {
++        ggml_cuda_set_device(p->devices[i]);
++        ggml_cuda_prof_mark(p->devices[i], static_cast<ggml_backend_cuda_context *>(backends[i]->context)->stream(), "~allreduce");
++    }
++    const bool ok = ggml_cuda_ar_allreduce_impl(p, backends, tensors);
++    for (int i = 0; i < p->n_devices; ++i) {
++        ggml_cuda_set_device(p->devices[i]);
++        ggml_cuda_prof_mark(p->devices[i], static_cast<ggml_backend_cuda_context *>(backends[i]->context)->stream(), "~after_ar");
++    }
++    return ok;
++}
++
+ #else // defined(GGML_USE_MUSA)
+ 
+ // MUSA lacks the host-mapped pinned-memory APIs (cudaHostAllocPortable
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 2e78ae4..375b267 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -749,9 +749,20 @@ static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, i
+ #if __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A || defined(GGML_USE_MUSA)
+     return __dp4a(a, b, c);
+ #else // __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A || defined(GGML_USE_MUSA)
++#if defined(__CUDA_ARCH__) && !defined(GGML_CUDA_NO_VMAD_DP4A)
++    // sm_60 (P100) has no __dp4a. vmad multiplies the byte lanes its selectors pick, sign-extended by the .s32
++    // operand types, and adds the accumulator, so four of them skip the byte extraction the fallback below compiles to.
++    asm("vmad.s32.s32.s32 %0, %1.b0, %2.b0, %0;\n\t"
++        "vmad.s32.s32.s32 %0, %1.b1, %2.b1, %0;\n\t"
++        "vmad.s32.s32.s32 %0, %1.b2, %2.b2, %0;\n\t"
++        "vmad.s32.s32.s32 %0, %1.b3, %2.b3, %0;"
++        : "+r"(c) : "r"(a), "r"(b));
++    return c;
++#else
+     const int8_t * a8 = (const int8_t *) &a;
+     const int8_t * b8 = (const int8_t *) &b;
+     return c + a8[0]*b8[0] + a8[1]*b8[1] + a8[2]*b8[2] + a8[3]*b8[3];
++#endif // defined(__CUDA_ARCH__) && !defined(GGML_CUDA_NO_VMAD_DP4A)
+ #endif // __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A || defined(GGML_USE_MUSA)
+ 
+ #endif // defined(GGML_USE_HIP)
+diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
+index 8981ab8..b741258 100644
+--- a/ggml/src/ggml-cuda/fattn-tile.cuh
++++ b/ggml/src/ggml-cuda/fattn-tile.cuh
+@@ -1,5 +1,6 @@
+ #include "common.cuh"
+ #include "fattn-common.cuh"
++#include "p100-tune.cuh"
+ 
+ // nbatch_fa == number of KQ rows to process per iteration
+ // nbatch_K == number of K columns to load in parallel for KQ calculation
+@@ -850,12 +851,20 @@ static __global__ void flash_attn_tile(
+ 
+     const int col_Q_0 = blockIdx.x * ncols1; // Index of the first Q column for this CUDA block to work on.
+ 
+-    const int sequence = blockIdx.z / (ne02/ncols2);
+-    const int head0 = blockIdx.z*ncols2 - sequence*ne02; // == blockIdx.z % (ne02/ncols2)
++    // 2026-10-08 P100 work: blocks are (sequence, K/V head, group of ncols2 Q heads) as in launch_fattn's grid, so
++    // ncols2 need not divide the GQA ratio: heads past the ratio are padding (zero Q, never written). With a dividing
++    // ncols2 this is the old mapping (head0 == blockIdx.z*ncols2 modulo ne02).
+     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
++    const int ntiles_z_gqa = (gqa_ratio + ncols2 - 1) / ncols2;
++    const int sequence = blockIdx.z / (ntiles_z_gqa*ne12);
++    const int z_rem    = blockIdx.z - sequence*(ntiles_z_gqa*ne12);
++    const int z_KV     = z_rem / ntiles_z_gqa;
++    const int zt_gqa   = z_rem - z_KV*ntiles_z_gqa;
++    const int head0    = z_KV*gqa_ratio + zt_gqa*ncols2;
++    const int nvalid2  = min(ncols2, gqa_ratio - zt_gqa*ncols2); // real Q heads in this block
+     const float * Q_f  = (const float *) (Q + nb03*sequence + nb02* head0);
+-    const half2 * K_h2 = (const half2 *) (K + nb13*sequence + nb12*(head0 / gqa_ratio));
+-    const half2 * V_h2 = (const half2 *) (V + nb23*sequence + nb22*(head0 / gqa_ratio)); // K and V have same shape
++    const half2 * K_h2 = (const half2 *) (K + nb13*sequence + nb12*z_KV);
++    const half2 * V_h2 = (const half2 *) (V + nb23*sequence + nb22*z_KV); // K and V have same shape
+ 
+     const half * maskh = mask ? (const half *) (mask + nb33*(sequence % ne33)) : nullptr;
+ 
+@@ -916,9 +925,11 @@ static __global__ void flash_attn_tile(
+         for (int i0 = 0; i0 < DKQp; i0 += np*warp_size*cpy_ne_D) {
+             if (i0 + np*warp_size*cpy_ne_D <= DKQ || i0 + (threadIdx.y % np)*(warp_size*cpy_ne_D) + threadIdx.x*cpy_ne_D < DKQ) {
+                 __align__(16) float tmp_f[cpy_ne_D] = {0.0f};
+-                ggml_cuda_memcpy_1<sizeof(tmp_f)>
+-                    (tmp_f, &Q_f[c*(nb02/sizeof(float)) + fastmodulo(col_Q_0 + j, ne01)*(nb01/sizeof(float))
+-                                 + i0 + (threadIdx.y % np)*(warp_size*cpy_ne_D) + threadIdx.x*cpy_ne_D]);
++                if (c < nvalid2) { // padding heads keep zero Q
++                    ggml_cuda_memcpy_1<sizeof(tmp_f)>
++                        (tmp_f, &Q_f[c*(nb02/sizeof(float)) + fastmodulo(col_Q_0 + j, ne01)*(nb01/sizeof(float))
++                                     + i0 + (threadIdx.y % np)*(warp_size*cpy_ne_D) + threadIdx.x*cpy_ne_D]);
++                }
+ 
+ #pragma unroll
+                 for (int i1 = 0; i1 < cpy_ne_D; ++i1) {
+@@ -1054,7 +1065,7 @@ static __global__ void flash_attn_tile(
+ #pragma unroll
+         for (int jc0 = 0; jc0 < cpw; ++jc0) {
+             const int jc = jc0 + (threadIdx.y/np)*cpw;
+-            const float sink = ((const float *) sinks)[head0 + jc % ncols2];
++            const float sink = jc % ncols2 < nvalid2 ? ((const float *) sinks)[head0 + jc % ncols2] : -INFINITY;
+ 
+             float KQ_max_new_j = fmaxf(KQ_max[jc0], sink);
+             const float KQ_max_scale = expf(KQ_max[jc0] - KQ_max_new_j);
+@@ -1090,6 +1101,9 @@ static __global__ void flash_attn_tile(
+         if (ncols1 > 1 && col_Q_0 + j >= int(ne01.z)) {
+             return;
+         }
++        if (c >= nvalid2) {
++            continue; // padding head
++        }
+ 
+         const float scale = gridDim.y == 1 ? 1.0f/KQ_sum[jc0] : 1.0f;
+ 
+@@ -1296,6 +1310,19 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
+     }
+ 
+     if constexpr (DKQ <= 512 && DKQ != 320 && DKQ != 192) {
++        // 2026-10-08 P100 work: a GQA ratio that no power of two divides well (Qwen3.8: 6) packs 2 heads below and
++        // reads every K/V head 3 times per pass; FA_GQA_PAD=4/8 packs 4 or 8 instead, padding the rest.
++        // One-token batches only (measured 2026-10-08 at 92k: 1 token 537 -> 392 us with 8; 4 tokens no gain, and
++        // slower at 8k, the wider tile being compute-bound on P100).
++        if (use_gqa_opt && ggml_cuda_tune.fa_gqa_pad >= 4 && gqa_ratio % 4 != 0 && gqa_ratio > 2 && Q->ne[1] == 1) {
++            if (ggml_cuda_tune.fa_gqa_pad >= 8 && gqa_ratio > 4) {
++                launch_fattn_tile_switch_ncols1<DKQ, DV, 8, use_logit_softcap>(ctx, dst);
++            } else {
++                launch_fattn_tile_switch_ncols1<DKQ, DV, 4, use_logit_softcap>(ctx, dst);
++            }
++            return;
++        }
++
+         if (use_gqa_opt && gqa_ratio % 8 == 0) {
+             launch_fattn_tile_switch_ncols1<DKQ, DV, 8, use_logit_softcap>(ctx, dst);
+             return;
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 27b8350..8bc25ea 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3,6 +3,9 @@
+ #include "ggml-backend-impl.h"
+ 
+ #include "ggml-cuda/allreduce.cuh"
++#include "ggml-cuda/p100-tune.cuh"
++#include "ggml-cuda/mmvh-pascal.cuh"
++#include "ggml-cuda/p100-prof.cuh"
+ #include "ggml-cuda/common.cuh"
+ #include "ggml-cuda/acc.cuh"
+ #include "ggml-cuda/add-id.cuh"
+@@ -1135,6 +1138,10 @@ static bool ggml_backend_cuda_comm_try_allreduce_nccl(
+ 
+ static bool ggml_backend_cuda_comm_try_allreduce_internal(
+         ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
++    // On Pascal the AR knob can send a call back to the meta backend's host-staged fallback.
++    if (!ggml_cuda_tune.ar && ggml_cuda_info().devices[comm_ctx->dev_ids[0]].cc < GGML_CUDA_CC_VOLTA) {
++        return false;
++    }
+     return ggml_backend_cuda_comm_allreduce_internal(comm_ctx, tensors);
+ }
+ 
+@@ -1803,9 +1810,11 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
+                              dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
+ 
+-    // fusion is not universally faster on Pascal
++    // fusion is not universally faster on Pascal; GGML_CUDA_FUSION_PASCAL=1 allows it to measure on the P100s, and on
++    // GP100 the FFN gate/up pair is fused when mmvh will run it (one kernel, shared activations, SWIGLU in the epilogue)
++    static const bool fusion_pascal = getenv("GGML_CUDA_FUSION_PASCAL") != nullptr && atoi(getenv("GGML_CUDA_FUSION_PASCAL"));
+     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+-    if (cc <= GGML_CUDA_CC_PASCAL) {
++    if (cc <= GGML_CUDA_CC_PASCAL && !fusion_pascal && !ggml_cuda_mmvh_pascal_fusable(tensor)) {
+         return false;
+     }
+     //we only support fusion for ncols_dst = 1
+@@ -4323,6 +4332,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     continue;
+                 }
+ 
++                ggml_cuda_tune_node_seq[cuda_ctx->device]++;
++                if (ggml_cuda_prof_live && !use_cuda_graph) {
++                    ggml_cuda_prof_node(cuda_ctx->device, cuda_ctx->stream(), node);
++                }
++
+                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+ 
+                 if (nodes_to_skip != 0) {
+@@ -4405,23 +4419,116 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+ 
+-    if (graph->graph == nullptr) {
+-        if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA) {
+-            if (!graph->disable_due_to_gpu_arch) {
+-                GGML_LOG_DEBUG("%s: disabling CUDA graphs due to GPU architecture\n", __func__);
+-            }
+-            graph->disable_due_to_gpu_arch = true;
+-        }
++    // Upstream turns graphs off for good before Volta. On the P100s the GRAPHS knob decides (GGML_CUDA_GRAPHS_PASCAL=1
++    // or the tune file), re-checked every call so it can be switched at runtime.
++    if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA) {
++        graph->disable_due_to_gpu_arch = !ggml_cuda_tune.graphs;
+     }
+ 
+     return graph->is_enabled();
+ }
+ #endif // USE_CUDA_GRAPH
+ 
++#include <sys/stat.h>
++#include <chrono>
++
++ggml_cuda_tune_knobs ggml_cuda_tune;
++uint64_t ggml_cuda_tune_node_seq[GGML_CUDA_MAX_DEVICES] = {};
++
++static void ggml_cuda_tune_apply(const char * key, const char * val) {
++    if      (strcmp(key, "AR")      == 0) { ggml_cuda_tune.ar      = atoi(val); }
++    else if (strcmp(key, "AR_BF16") == 0) { ggml_cuda_tune.ar_bf16 = atoi(val); }
++    else if (strcmp(key, "GRAPHS")  == 0) { ggml_cuda_tune.graphs  = atoi(val); }
++    else if (strcmp(key, "MMVH")    == 0) { ggml_cuda_tune.mmvh    = atoi(val); }
++    else if (strcmp(key, "MMVH_IQ4") == 0) { ggml_cuda_tune.mmvh_iq4 = atoi(val); }
++    else if (strcmp(key, "MMVH_FUSE") == 0) { ggml_cuda_tune.mmvh_fuse = atoi(val); }
++    else if (strcmp(key, "MMVH_MC")   == 0) { ggml_cuda_tune.mmvh_mc   = atoi(val); }
++    else if (strcmp(key, "PROF")      == 0) { ggml_cuda_prof_arm(atoi(val)); }
++    else if (strcmp(key, "FA_GQA_PAD") == 0) { ggml_cuda_tune.fa_gqa_pad = atoi(val); }
++    else if (strcmp(key, "MMVH_IQ4_MC") == 0) { ggml_cuda_tune.mmvh_iq4_mc = atoi(val); }
++    else if (strcmp(key, "MMVH_MC_Q6")  == 0) { ggml_cuda_tune.mmvh_mc_q6  = atoi(val); }
++    // 2026-10-17 (Flash-Next)
++    else if (strcmp(key, "MMVQ_ID")     == 0) { ggml_cuda_tune.mmvq_id     = atoi(val); }
++    else if (strcmp(key, "MMVF_SHORTK") == 0) { ggml_cuda_tune.mmvf_shortk = atoi(val); }
++    else if (strcmp(key, "MMVQ")    == 0) {
++        int s = 0, l = 0;
++        if (sscanf(val, "%d,%d", &s, &l) < 2) {
++            l = s;
++        }
++        ggml_cuda_tune.mmvq_s = s;
++        ggml_cuda_tune.mmvq_l = l;
++    }
++}
++
++bool ggml_cuda_tune_file_active() {
++    return getenv("GGML_CUDA_TUNE_FILE") != nullptr;
++}
++
++void ggml_cuda_tune_refresh() {
++    static bool   env_done = false;
++    static double last_check = 0.0;
++    static long long last_mtime = -1;
++    if (!env_done) {
++        env_done = true;
++        static const std::pair<const char *, const char *> env_keys[] = {
++            {"GGML_CUDA_AR_PASCAL", "AR"}, {"GGML_CUDA_AR_BF16_THRESHOLD", "AR_BF16"},
++            {"GGML_CUDA_GRAPHS_PASCAL", "GRAPHS"}, {"GGML_CUDA_MMVQ_PASCAL_CFG", "MMVQ"},
++            {"GGML_CUDA_MMVH_PASCAL", "MMVH"}, {"GGML_CUDA_MMVH_IQ4", "MMVH_IQ4"}, {"GGML_CUDA_MMVH_FUSE", "MMVH_FUSE"},
++            {"GGML_CUDA_MMVH_MC", "MMVH_MC"}, {"GGML_CUDA_FA_GQA_PAD", "FA_GQA_PAD"},
++            {"GGML_CUDA_MMVH_IQ4_MC", "MMVH_IQ4_MC"},
++            {"GGML_CUDA_MMVH_MC_Q6", "MMVH_MC_Q6"},
++            {"GGML_CUDA_MMVQ_ID_PASCAL", "MMVQ_ID"}, {"GGML_CUDA_MMVF_SHORTK_PASCAL", "MMVF_SHORTK"}, // 2026-10-17
++        };
++        for (const auto & kv : env_keys) {
++            if (const char * v = getenv(kv.first)) {
++                ggml_cuda_tune_apply(kv.second, v);
++            }
++        }
++    }
++    const char * path = getenv("GGML_CUDA_TUNE_FILE");
++    if (path == nullptr) {
++        return;
++    }
++    const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
++    if (now - last_check < 0.2) {
++        return;
++    }
++    last_check = now;
++    struct stat st;
++    if (stat(path, &st) != 0 || (long long) st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec == last_mtime) {
++        return;
++    }
++    last_mtime = (long long) st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec;
++    FILE * f = fopen(path, "r");
++    if (f == nullptr) {
++        return;
++    }
++    char line[256];
++    while (fgets(line, sizeof(line), f)) {
++        char * eq = strchr(line, '=');
++        if (eq == nullptr) {
++            continue;
++        }
++        *eq = 0;
++        char * nl = strpbrk(eq + 1, "\r\n");
++        if (nl) {
++            *nl = 0;
++        }
++        ggml_cuda_tune_apply(line, eq + 1);
++    }
++    fclose(f);
++    GGML_LOG_INFO("%s: AR=%d AR_BF16=%d GRAPHS=%d MMVQ=%d,%d MMVH=%d\n", __func__, ggml_cuda_tune.ar, ggml_cuda_tune.ar_bf16,
++                  ggml_cuda_tune.graphs, ggml_cuda_tune.mmvq_s, ggml_cuda_tune.mmvq_l, ggml_cuda_tune.mmvh);
++}
++
+ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+ 
++    ggml_cuda_tune_refresh();
+     ggml_cuda_set_device(cuda_ctx->device);
++    if (ggml_cuda_prof_gen) {
++        ggml_cuda_prof_segment_begin(cuda_ctx->device, cuda_ctx->stream());
++    }
+ 
+     bool use_cuda_graph             = false;
+     bool cuda_graph_update_required = false;
+@@ -4474,6 +4581,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+ 
+     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+ 
++    if (ggml_cuda_prof_live) {
++        ggml_cuda_prof_segment_end(cuda_ctx->device, cuda_ctx->stream());
++    }
++
+     return GGML_STATUS_SUCCESS;
+ }
+ 
+diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
+index bd5c5d4..cfabe23 100644
+--- a/ggml/src/ggml-cuda/mmvf.cu
++++ b/ggml/src/ggml-cuda/mmvf.cu
+@@ -3,6 +3,7 @@
+ #include "unary.cuh"
+ #include "mmvf.cuh"
+ #include "convert.cuh"
++#include "p100-tune.cuh"
+ 
+ template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
+ static __global__ void mul_mat_vec_f(
+@@ -606,6 +607,76 @@ static void mul_mat_vec_f_cuda_switch_ncols_dst(
+     }
+ }
+ 
++// P100 work (2026-10-17, Flash-Next): one-token mat-vec for short rows on pre-Volta (MMVF_SHORTK = rows per warp).
++// The generic kernel gives every row its own block sized to K; at K = 320 (hyper-connection up projections, 10240
++// rows, BF16) that is 10240 blocks of 160 threads doing one FMA each plus a shared-memory reduction, 72 us for 6.25 MiB.
++// Here a warp owns R rows, its lanes stride over K in pairs and reduce with shuffles. F32 accumulation throughout.
++template <typename T>
++static __device__ __forceinline__ float2 mmvf_shortk_pair(const T * row, const int c) {
++    if constexpr (std::is_same_v<T, float>) {
++        return ((const float2 *) row)[c];
++    } else if constexpr (std::is_same_v<T, half>) {
++        return __half22float2(((const half2 *) row)[c]);
++    } else {
++        const nv_bfloat162 v = ((const nv_bfloat162 *) row)[c];
++        return make_float2(ggml_cuda_cast<float>(v.x), ggml_cuda_cast<float>(v.y));
++    }
++}
++
++template <typename T, int R>
++static __global__ void __launch_bounds__(4*WARP_SIZE) mmvf_shortk_kernel(
++        const T * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst,
++        const int ncols2, const int nrows, const int64_t stride_row) {
++    const int lane = threadIdx.x;
++    const int row0 = (blockIdx.x*blockDim.y + threadIdx.y)*R;
++    if (row0 >= nrows) {
++        return;
++    }
++    const float2 * y2 = (const float2 *) y;
++    float sum[R];
++#pragma unroll
++    for (int r = 0; r < R; ++r) {
++        sum[r] = 0.0f;
++    }
++    for (int c = lane; c < ncols2; c += WARP_SIZE) {
++        const float2 yv = y2[c];
++#pragma unroll
++        for (int r = 0; r < R; ++r) {
++            if (row0 + r < nrows) {
++                const float2 xv = mmvf_shortk_pair<T>(x + (row0 + r)*stride_row, c);
++                sum[r] = fmaf(xv.x, yv.x, sum[r]);
++                sum[r] = fmaf(xv.y, yv.y, sum[r]);
++            }
++        }
++    }
++#pragma unroll
++    for (int r = 0; r < R; ++r) {
++        sum[r] = warp_reduce_sum(sum[r]);
++    }
++    if (lane == 0) {
++#pragma unroll
++        for (int r = 0; r < R; ++r) {
++            if (row0 + r < nrows) {
++                dst[row0 + r] = sum[r];
++            }
++        }
++    }
++}
++
++template <typename T>
++static void mmvf_shortk_cuda(const T * x, const float * y, float * dst, const int64_t ncols, const int64_t nrows,
++        const int64_t stride_row, const int rows_per_warp, cudaStream_t stream) {
++    const dim3 block_dims(WARP_SIZE, 4, 1);
++    const int  ncols2 = ncols/2;
++    switch (rows_per_warp) {
++        case 1: mmvf_shortk_kernel<T, 1><<<(nrows + 3)/4,  block_dims, 0, stream>>>(x, y, dst, ncols2, nrows, stride_row); break;
++        case 2: mmvf_shortk_kernel<T, 2><<<(nrows + 7)/8,  block_dims, 0, stream>>>(x, y, dst, ncols2, nrows, stride_row); break;
++        case 8: mmvf_shortk_kernel<T, 8><<<(nrows + 31)/32, block_dims, 0, stream>>>(x, y, dst, ncols2, nrows, stride_row); break;
++        default: mmvf_shortk_kernel<T, 4><<<(nrows + 15)/16, block_dims, 0, stream>>>(x, y, dst, ncols2, nrows, stride_row); break;
++    }
++    CUDA_CHECK(cudaGetLastError());
++}
++
+ template<typename T>
+ static void mul_mat_vec_f_cuda(
+         const T * x, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+@@ -616,6 +687,15 @@ static void mul_mat_vec_f_cuda(
+         const int64_t nsamples_dst, const int64_t stride_sample_x, const int64_t stride_sample_y, const int64_t stride_sample_dst,
+         const int64_t ids_stride, enum ggml_prec prec, cudaStream_t stream) {
+ 
++    // P100 work (2026-10-17): short-row one-token path, see mmvf_shortk_kernel.
++    if (ggml_cuda_tune.mmvf_shortk > 0 && ids == nullptr && ncols_dst == 1 && ncols <= 1024 &&
++            fusion.gate == nullptr && fusion.x_bias == nullptr && fusion.gate_bias == nullptr &&
++            nchannels_x == 1 && nchannels_dst == 1 && nsamples_x == 1 && nsamples_dst == 1 &&
++            ggml_cuda_info().devices[ggml_cuda_get_device()].cc < GGML_CUDA_CC_VOLTA) {
++        mmvf_shortk_cuda(x, y, dst, ncols, nrows, stride_row, ggml_cuda_tune.mmvf_shortk, stream);
++        return;
++    }
++
+     if constexpr(std::is_same_v<T, half>) {
+         if (prec == GGML_PREC_DEFAULT) {
+             mul_mat_vec_f_cuda_switch_ncols_dst<T, half>
+@@ -815,7 +895,9 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
+                 if (cc >= GGML_CUDA_CC_TURING) {
+                     return ne11 <= 4;
+                 }
+-                return ne11 <= 3;
++                // pre-Turing has no matrix cores, like the other branches that return 8; at 3 the 4-column MTP
++                // verify batches fell into cuBLAS SGEMM on the P100s
++                return ne11 <= 8;
+             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
+                 if (fp32_mma_hardware_available(cc)) {
+                     return ne11 <= 3;
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index a851553..41628f2 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1,4 +1,6 @@
+ #include "mmvq.cuh"
++#include "p100-tune.cuh"
++#include "mmvh-pascal.cuh"
+ #include "quantize.cuh"
+ #include "unary.cuh"
+ #include "vecdotq.cuh"
+@@ -100,9 +102,37 @@ enum mmvq_parameter_table_id {
+     MMVQ_PARAMETERS_RDNA2,
+     MMVQ_PARAMETERS_RDNA3_0,
+     MMVQ_PARAMETERS_RDNA4,
+-    MMVQ_PARAMETERS_GB10
++    MMVQ_PARAMETERS_GB10,
++    MMVQ_PARAMETERS_PASCAL,  // NVIDIA before Volta: GENERIC, except rows per block at ncols_dst == 1
+ };
+ 
++// Output rows per block for one-token mat-vec on pre-Volta NVIDIA. With one row per block every row re-reads the
++// q8_1 activations from L2, and on the P100 that load rather than DRAM bound decode (~30% of memory bandwidth).
++#ifndef GGML_CUDA_MMVQ_PASCAL_RPB
++#define GGML_CUDA_MMVQ_PASCAL_RPB 4
++#endif
++
++// Tuning presets for one-token mat-vec on Pascal, chosen at runtime by GGML_CUDA_MMVQ_PASCAL_CFG ("S,L").
++// 0 is the compiled default; 1..7 = (warps, rows per block) below.
++// 8..10 added 2026-10-17 for the short expert rows of Flash-Next (MMVQ_ID): 1 warp x 8 rows, 1 x 2, 2 x 2.
++static constexpr __host__ __device__ int mmvq_pascal_cfg_nwarps(int c) {
++    return c == 1 ? 4 : c == 2 ? 4 : c == 3 ? 2 : c == 4 ? 2 : c == 5 ? 8 : c == 6 ? 8 : c == 7 ? 1 :
++           c == 8 ? 1 : c == 9 ? 1 : c == 10 ? 2 : 0;
++}
++static constexpr __host__ __device__ int mmvq_pascal_cfg_rpb(int c) {
++    return c == 1 ? 2 : c == 2 ? 8 : c == 3 ? 4 : c == 4 ? 8 : c == 5 ? 2 : c == 6 ? 4 : c == 7 ? 4 :
++           c == 8 ? 8 : c == 9 ? 2 : c == 10 ? 2 : 0;
++}
++// Types whose one-token MUL_MAT_ID takes a preset through MMVQ_ID (2026-10-17, Flash-Next's expert types).
++static constexpr bool mmvq_pascal_tunable_id(ggml_type type) {
++    return type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ4_NL ||
++           type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q2_0;
++}
++static constexpr bool mmvq_pascal_tunable(ggml_type type) {
++    return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K || type == GGML_TYPE_IQ4_XS ||
++           type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q3_K;
++}
++
+ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
+ #if defined(RDNA4)
+     return MMVQ_PARAMETERS_RDNA4;
+@@ -116,6 +146,8 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
+     return MMVQ_PARAMETERS_TURING;
+ #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
+     return MMVQ_PARAMETERS_GB10;
++#elif defined(__CUDA_ARCH__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ < GGML_CUDA_CC_VOLTA
++    return MMVQ_PARAMETERS_PASCAL;
+ #else
+     return MMVQ_PARAMETERS_GENERIC;
+ #endif
+@@ -137,6 +169,9 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
+     if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_TURING && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_AMPERE) {
+         return MMVQ_PARAMETERS_TURING;
+     }
++    if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_VOLTA) {
++        return MMVQ_PARAMETERS_PASCAL;
++    }
+     if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_DGX_SPARK) {
+         return MMVQ_PARAMETERS_GB10;
+     }
+@@ -450,7 +485,7 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
+ }
+ 
+ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
+-    if (table_id == MMVQ_PARAMETERS_GENERIC) {
++    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_PASCAL) {
+         switch (ncols_dst) {
+             case 1:
+             case 2:
+@@ -577,6 +612,12 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
+ }
+ 
+ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
++    if (table_id == MMVQ_PARAMETERS_PASCAL && ncols_dst == 1) {
++        return small_k && nwarps > GGML_CUDA_MMVQ_PASCAL_RPB ? nwarps : GGML_CUDA_MMVQ_PASCAL_RPB;
++    }
++    if (table_id == MMVQ_PARAMETERS_PASCAL) {
++        table_id = MMVQ_PARAMETERS_GENERIC;
++    }
+     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
+         switch (ncols_dst) {
+             case 1:
+@@ -596,8 +637,8 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int
+     return 1;
+ }
+ 
+-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false>
+-__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
++template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, int pcfg = 0>
++__launch_bounds__((pcfg ? mmvq_pascal_cfg_nwarps(pcfg) : calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters))*ggml_cuda_get_physical_warp_size(), 1)
+ static __global__ void mul_mat_vec_q(
+         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
+         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
+@@ -614,8 +655,8 @@ static __global__ void mul_mat_vec_q(
+     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+     constexpr int vdr = get_vdr_mmvq(type);
+     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
+-    constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
+-    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
++    constexpr int nwarps = pcfg ? mmvq_pascal_cfg_nwarps(pcfg) : calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
++    constexpr int rows_per_cuda_block = pcfg ? mmvq_pascal_cfg_rpb(pcfg) : calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+ 
+     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+@@ -712,6 +753,39 @@ static __global__ void mul_mat_vec_q(
+     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
+     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
+ 
++#if defined(__CUDA_ARCH__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ < GGML_CUDA_CC_VOLTA
++    constexpr bool pascal_ptr_loop = !has_fusion;
++#else
++    constexpr bool pascal_ptr_loop = false;
++#endif
++    if constexpr (pascal_ptr_loop) {
++        // Pascal has no 32-bit integer multiply (3 XMAD each): step one pointer per row instead of re-deriving every
++        // block address from kbx each iteration, which was about a quarter of the Q5_K loop's instructions.
++        constexpr int    kyb = qk/QK8_1; // q8_1 blocks per x block
++        constexpr size_t bs  = ggml_cuda_type_traits<type>::bs;
++        const int kbx0 = tid / (qi/vdr);
++        const int kqs  = vdr * (tid % (qi/vdr));
++        const char * xp[rows_per_cuda_block];
++#pragma unroll
++        for (int i = 0; i < rows_per_cuda_block; ++i) {
++            xp[i] = (const char *) vx + (size_t) (kbx_offset + i*stride_row_x + kbx0) * bs;
++        }
++        const block_q8_1 * yp = y + kbx0*kyb;
++        for (int kbx = kbx0; kbx < blocks_per_row_x; kbx += blocks_per_iter) {
++#pragma unroll
++            for (int j = 0; j < ncols_dst; ++j) {
++#pragma unroll
++                for (int i = 0; i < rows_per_cuda_block; ++i) {
++                    tmp[j][i] += vec_dot_q_cuda(xp[i], yp + j*stride_col_y, 0, kqs);
++                }
++            }
++#pragma unroll
++            for (int i = 0; i < rows_per_cuda_block; ++i) {
++                xp[i] += blocks_per_iter*bs;
++            }
++            yp += blocks_per_iter*kyb;
++        }
++    } else {
+     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
+ 
+@@ -753,6 +827,7 @@ static __global__ void mul_mat_vec_q(
+             }
+         }
+     }
++    } // pascal_ptr_loop
+ 
+     __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
+     [[maybe_unused]] __shared__ float tmp_shared_gate[(has_fusion && (nwarps-1 > 0)) ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
+@@ -998,16 +1073,17 @@ static __global__ void mul_mat_vec_q_moe(
+ template<ggml_type type>
+ static std::pair<dim3, dim3> calc_launch_params(
+         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
+-        const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false) {
+-    const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
+-    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
++        const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false,
++        const int pcfg = 0) {
++    const int nwarps = pcfg ? mmvq_pascal_cfg_nwarps(pcfg) : calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
++    const int rpb = pcfg ? mmvq_pascal_cfg_rpb(pcfg) : calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
+     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
+     const dim3 block_dims(warp_size, nwarps, 1);
+     return {block_nums, block_dims};
+ }
+ 
+-template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false>
++template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false, int pcfg = 0>
+ static void mul_mat_vec_q_switch_fusion(
+         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
+@@ -1022,7 +1098,7 @@ static void mul_mat_vec_q_switch_fusion(
+     if constexpr (c_ncols_dst == 1) {
+         if (has_fusion) {
+             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
+-            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters>, launch_params,
++            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, pcfg>, launch_params,
+                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+@@ -1033,7 +1109,7 @@ static void mul_mat_vec_q_switch_fusion(
+     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
+ 
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
+-    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters>, launch_params,
++    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, pcfg>, launch_params,
+         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+@@ -1178,8 +1254,9 @@ static void mul_mat_vec_q_switch_ncols_dst(
+             static constexpr int c_ncols_dst = 1;
+ 
+             // Tag types keep the flags compile-time, so __launch_bounds__ matches what is launched.
+-            const auto launch = [&](auto small_k_tag, auto halve_iters_tag) {
++            const auto launch = [&](auto small_k_tag, auto halve_iters_tag, auto pcfg_tag) {
+                 constexpr bool c_small_k = decltype(small_k_tag)::value;
++                constexpr int  c_pcfg    = decltype(pcfg_tag)::value;
+                 // Types the table does not promote would compile a second, identical kernel.
+                 constexpr bool c_promoted =
+                     calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_GB10, false, true) !=
+@@ -1188,20 +1265,52 @@ static void mul_mat_vec_q_switch_ncols_dst(
+                 constexpr bool c_halve_iters = decltype(halve_iters_tag)::value && c_promoted;
+ 
+                 const std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
+-                                                                              nsamples_dst, warp_size, table_id, c_small_k, c_halve_iters);
+-                mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, c_halve_iters>(
++                                                                              nsamples_dst, warp_size, table_id, c_small_k, c_halve_iters, c_pcfg);
++                mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, c_halve_iters, c_pcfg>(
+                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
+                     stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
+                     stream);
+             };
+ 
++            using pcfg0 = std::integral_constant<int, 0>;
++            // P100 work (2026-10-17, Flash-Next): MMVQ_ID picks a preset for one-token MUL_MAT_ID. Expert rows of K 640 /
++            // 2560 left most of the default 4-warp block idle, and the IQ grid types never get small_k on Pascal.
++            if constexpr (mmvq_pascal_tunable_id(type)) {
++                const int pcfg_id = table_id == MMVQ_PARAMETERS_PASCAL && has_ids ? ggml_cuda_tune.mmvq_id : 0;
++                switch (pcfg_id) {
++                    case 1:  launch(std::false_type{}, std::false_type{}, std::integral_constant<int, 1>{});  return;
++                    case 2:  launch(std::false_type{}, std::false_type{}, std::integral_constant<int, 2>{});  return;
++                    case 3:  launch(std::false_type{}, std::false_type{}, std::integral_constant<int, 3>{});  return;
++                    case 4:  launch(std::false_type{}, std::false_type{}, std::integral_constant<int, 4>{});  return;
++                    case 5:  launch(std::false_type{}, std::false_type{}, std::integral_constant<int, 5>{});  return;
++                    case 6:  launch(std::false_type{}, std::false_type{}, std::integral_constant<int, 6>{});  return;
++                    case 7:  launch(std::false_type{}, std::false_type{}, std::integral_constant<int, 7>{});  return;
++                    case 8:  launch(std::false_type{}, std::false_type{}, std::integral_constant<int, 8>{});  return;
++                    case 9:  launch(std::false_type{}, std::false_type{}, std::integral_constant<int, 9>{});  return;
++                    case 10: launch(std::false_type{}, std::false_type{}, std::integral_constant<int, 10>{}); return;
++                    default: break;
++                }
++            }
+             if (should_use_small_k(c_ncols_dst)) {
+-                launch(std::true_type{},  std::false_type{});
++                launch(std::true_type{},  std::false_type{}, pcfg0{});
+             } else if (should_halve_iters()) {
+-                launch(std::false_type{}, std::true_type{});
++                launch(std::false_type{}, std::true_type{}, pcfg0{});
++            } else if constexpr (mmvq_pascal_tunable(type)) {
++                const int pcfg = table_id == MMVQ_PARAMETERS_PASCAL && !has_ids ?
++                    (ncols_x <= 6144 ? ggml_cuda_tune.mmvq_s : ggml_cuda_tune.mmvq_l) : 0;
++                switch (pcfg) {
++                    case 1:  launch(std::false_type{}, std::false_type{}, std::integral_constant<int, 1>{}); break;
++                    case 2:  launch(std::false_type{}, std::false_type{}, std::integral_constant<int, 2>{}); break;
++                    case 3:  launch(std::false_type{}, std::false_type{}, std::integral_constant<int, 3>{}); break;
++                    case 4:  launch(std::false_type{}, std::false_type{}, std::integral_constant<int, 4>{}); break;
++                    case 5:  launch(std::false_type{}, std::false_type{}, std::integral_constant<int, 5>{}); break;
++                    case 6:  launch(std::false_type{}, std::false_type{}, std::integral_constant<int, 6>{}); break;
++                    case 7:  launch(std::false_type{}, std::false_type{}, std::integral_constant<int, 7>{}); break;
++                    default: launch(std::false_type{}, std::false_type{}, pcfg0{}); break;
++                }
+             } else {
+-                launch(std::false_type{}, std::false_type{});
++                launch(std::false_type{}, std::false_type{}, pcfg0{});
+             }
+         } break;
+         case 2: {
+@@ -1425,6 +1534,12 @@ void ggml_cuda_mul_mat_vec_q(
+     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
+     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
+ 
++    // GP100: Q4_K/Q5_K one-token mat-vec on HFMA2 instead of emulated dp4a, behind the MMVH knob
++    if (ggml_cuda_mmvh_pascal_supported(src0, src1, ids, dst, fusion)) {
++        ggml_cuda_mmvh_pascal(ctx, src0, src1, dst, fusion);
++        return;
++    }
++
+     GGML_TENSOR_BINARY_OP_LOCALS;
+ 
+     cudaStream_t stream = ctx.stream();
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 8402fcf..eadab37 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9921,12 +9921,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  8, 16*256, { 1,  1}, {1, 1}));
+     }
+ 
+-    // Multi-column MMVQ coverage for the Q4_K weight-reuse path and a Q5_K control.
+-    for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
++    // P100 work (2026-10-08): Qwen3.8 attention per GPU = 2 K/V heads x GQA 6, head size 256 (FA_GQA_PAD packing)
++    for (int64_t nb : {1, 4, 8, 33}) {
++        for (bool sinks : {false, true}) {
++            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 1024, nb, true, sinks, 0.0f, 0.0f,
++                                                            GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++        }
++    }
++
++    // Multi-column MMVQ coverage for the Q4_K weight-reuse path and a Q5_K control (+ Q6_K, IQ4_XS: P100 mmvh, 2026-10-07).
++    for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS }) {
+         for (int n = 1; n <= 8; ++n) {
+             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, n, 1024, { 1, 1 }, { 1, 1 }));
+             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1023, n, 4096, { 1, 1 }, { 1, 1 }));
+         }
++        // Qwen3.8 K per GPU: 5120 = 20 super-blocks (half-warp mode), 8704 = 34 (full mode, partial last step); P100 mmvh v4
++        // (IQ4_XS included since brick 7)
++        for (int n = 2; n <= 4; ++n) {
++            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1001, n, 5120, { 1, 1 }, { 1, 1 }));
++            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,   37, n, 8704, { 1, 1 }, { 1, 1 }));
++        }
+     }
+ 
+     // The SYCL backend picks between one and two output rows per subgroup by row count when there
+@@ -10174,6 +10188,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     }
+     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
+ 
++    // P100 work (2026-10-17): Flash-Next one-token expert shapes (32 instead of 256 experts) for the MMVQ_ID presets,
++    // and short-K float mat-vecs for MMVF_SHORTK (incl. row counts that are not a multiple of the rows per block).
++    for (ggml_type type_a : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS}) {
++        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 10, true, 640, 1, 2560));
++    }
++    for (ggml_type type_a : {GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_0}) {
++        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 10, false, 2560, 1, 640));
++    }
++    for (ggml_type type_a : {GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32}) {
++        for (auto mk : std::vector<std::pair<int64_t, int64_t>>{{10240, 320}, {1001, 96}, {37, 1024}, {33, 2}}) {
++            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, mk.first, 1, mk.second, {1, 1}, {1, 1}));
++        }
++    }
++
+     // multiple blocks per row: exercises the block-stride loop and the
+     // per-expert base offset, which k == 256 alone leaves untested
+     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 28, 10, false, 1024, 1, 4096));
+@@ -11553,6 +11581,36 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         test_cases.emplace_back(new test_l2_norm_batch(GGML_TYPE_F32, { n, 16, 16, 1 }, 4, 1e-12f, true));
+     }
+ 
++    // P100 work (2026-10-08): Qwen3.8 attention per GPU at 8k and 92k context, decode (1) and MTP verify (4)
++    for (int64_t kv : {8192, 92160}) {
++        for (int64_t nb : {1, 4}) {
++            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0.0f, 0.0f,
++                                                            GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++        }
++    }
++
++    // P100 work (slerm, 2026-10-07): Qwen3.8-27B one-token decode shapes, per GPU under tensor split (m = rows, k = K)
++    // and under layer split (17408), plus the halved output head.
++    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_0}) {
++        for (auto mk : std::vector<std::pair<int64_t, int64_t>>{{8704, 5120}, {5120, 8704}, {17408, 5120}, {5120, 17408}, {124160, 5120}}) {
++            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, mk.first, 1, mk.second, {1, 1}, {1, 1}));
++            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, mk.first, 4, mk.second, {1, 1}, {1, 1})); // MTP verify
++        }
++    }
++
++    // P100 work (2026-10-17): Qwen3.8-Flash-Next one-token decode. Experts (64 of the 256 allocated to keep host RAM
++    // small; 10 picked at random each run, so still DRAM-bound): gate/up 640 x 2560 with the input shared, down
++    // 2560 x 640 with one input row per expert. Hyper-connection up (10240 x 320) and down (320 x 10240) projections.
++    for (ggml_type type_a : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS}) {
++        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 64, 10, true, 640, 1, 2560));
++    }
++    for (ggml_type type_a : {GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_0}) {
++        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 64, 10, false, 2560, 1, 640));
++    }
++    for (ggml_type type_a : {GGML_TYPE_BF16, GGML_TYPE_F16}) {
++        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 10240, 1, 320, {1, 1}, {1, 1}));
++        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 320, 1, 10240, {1, 1}, {1, 1}));
++    }
+ 
+     return test_cases;
+ }
+@@ -12141,7 +12199,9 @@ int main(int argc, char ** argv) {
+         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+         auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+         if (ggml_backend_set_n_threads_fn) {
+-            ggml_backend_set_n_threads_fn(backend.get(), std::max<int>(1, N_THREADS/2));
++            // 2026-10-17: GGML_TEST_THREADS overrides the CPU thread count (P100/NUMA work)
++            const char * test_threads = getenv("GGML_TEST_THREADS");
++            ggml_backend_set_n_threads_fn(backend.get(), test_threads ? std::max(1, atoi(test_threads)) : std::max<int>(1, N_THREADS/2));
+         }
+ 
+         size_t free, total;  // NOLINT

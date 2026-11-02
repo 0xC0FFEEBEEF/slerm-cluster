@@ -1,0 +1,14 @@
+v0.5.0
+ M common/sampling.cpp
+ M ggml/src/ggml-cuda/allreduce.cu
+ M ggml/src/ggml-cuda/common.cuh
+ M ggml/src/ggml-cuda/fattn-tile.cuh
+ M ggml/src/ggml-cuda/ggml-cuda.cu
+ M ggml/src/ggml-cuda/mmvf.cu
+ M ggml/src/ggml-cuda/mmvq.cu
+ M tests/test-backend-ops.cpp
+?? ggml/src/ggml-cuda/mmvh-pascal.cu
+?? ggml/src/ggml-cuda/mmvh-pascal.cuh
+?? ggml/src/ggml-cuda/p100-prof.cu
+?? ggml/src/ggml-cuda/p100-prof.cuh
+?? ggml/src/ggml-cuda/p100-tune.cuh

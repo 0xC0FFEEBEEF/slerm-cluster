@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# slerm-llm-ctl -- scoped control of the slerm llama.cpp router and its RPC workers.
+#
+# Deliberately narrow: every scancel here is resolved BY JOB NAME from squeue
+# (llm-router / llm-rpcworker / llm-rpccpu, owned by $CLUSTER_USER) rather than
+# taking a job id, so this tool cannot cancel anything else on the cluster even
+# if called wrongly. That is what makes it safe to allowlist.
+#
+# Usage:
+#   slerm-llm-ctl status
+#   slerm-llm-ctl restart [worker-list]     # default: node01,node02,node05
+#   slerm-llm-ctl worker-mem <node> <mem>   # resubmit one CPU worker with new --mem
+#   slerm-llm-ctl models                    # list models the router is serving
+#   slerm-llm-ctl logs [n]                  # tail the live router log
+set -uo pipefail
+
+HEAD=slerm-head
+CLUSTER_USER=slerm
+ENDPOINT=http://slerm-node03:8080/v1
+DEFAULT_WORKERS="slerm-node01,slerm-node02,slerm-node05"
+JOBS=/data/llm/jobs
+
+h() { printf '\n\033[1;36m== %s\033[0m\n' "$*"; }
+die() { printf '\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
+rsh() { timeout 60 ssh -o BatchMode=yes -o ConnectTimeout=10 "$HEAD" "$@"; }
+
+jobs_table() {
+  rsh "squeue -u $CLUSTER_USER -o '%.8i %.16j %.9T %.11M %.14R'"
+}
+
+# Resolve a job id ONLY from an allowed job name, so nothing else is cancellable.
+job_id_by_name() {
+  local name="$1"
+  case "$name" in
+    llm-router|llm-rpcworker|llm-rpccpu) ;;
+    *) die "refusing to resolve job name '$name' (not an llm job)" ;;
+  esac
+  rsh "squeue -h -u $CLUSTER_USER -n $name -t R -o '%i'" 2>/dev/null | head -1 | tr -d '[:space:]'
+}
+
+endpoint_up() {
+  timeout 10 curl -s --max-time 6 "$ENDPOINT/models" >/dev/null 2>&1
+}
+
+wait_endpoint() {
+  local max=${1:-60} i
+  for ((i = 1; i <= max; i++)); do
+    endpoint_up && { echo "  endpoint up after ~$((i * 10))s"; return 0; }
+    sleep 10
+  done
+  return 1
+}
+
+cmd_status() {
+  h "jobs"; jobs_table
+  h "endpoint"
+  if endpoint_up; then echo "  UP   $ENDPOINT"; else echo "  DOWN $ENDPOINT"; fi
+  h "rpc devices (from live router log)"
+  local rj; rj=$(job_id_by_name llm-router)
+  [ -n "$rj" ] && rsh "grep -iE 'rpc devices|WARNING cpu' /data/llm/logs/router-$rj.out 2>/dev/null | tail -3"
+}
+
+cmd_restart() {
+  local workers="${1:-$DEFAULT_WORKERS}"
+  local rj; rj=$(job_id_by_name llm-router)
+  if [ -n "$rj" ]; then
+    h "cancelling router job $rj (resolved by name llm-router)"
+    rsh "scancel $rj" || die "scancel failed"
+    # llama-server does not set SO_REUSEADDR; the old socket blocks the rebind.
+    echo "  waiting 25s for the socket to clear"; sleep 25
+  else
+    h "no running router to cancel"
+  fi
+  h "submitting router with LLM_CPU_WORKER=$workers"
+  # MUST be exported, not passed via --export=ALL,VAR=a,b -- sbatch splits
+  # --export on commas and a comma-containing value silently truncates.
+  rsh "export LLM_CPU_WORKER='$workers'; cd /data/llm && sbatch --export=ALL $JOBS/router-rpc.sh" \
+    || die "sbatch failed"
+  h "waiting for endpoint"
+  wait_endpoint 60 || die "endpoint never came up"
+  local nj; nj=$(job_id_by_name llm-router)
+  h "rpc devices"
+  rsh "grep -iE 'adopting|submitted cpu|using .*for|up after|WARNING|rpc devices' /data/llm/logs/router-$nj.out 2>/dev/null | tail -12"
+}
+
+cmd_worker_mem() {
+  local node="${1:?node required}" mem="${2:?mem required, e.g. 30G}"
+  case "$node" in
+    slerm-node01|slerm-node02|slerm-node05|deadlock) ;;
+    *) die "refusing: '$node' is not a CPU RPC worker node" ;;
+  esac
+  local script=$JOBS/rpc-worker-cpu.sh
+  case "$node" in slerm-node05|deadlock) script=$JOBS/rpc-worker-cpu-avx.sh ;; esac
+  local cj
+  cj=$(rsh "squeue -h -u $CLUSTER_USER -n llm-rpccpu -t R -w $node -o '%i'" | head -1 | tr -d '[:space:]')
+  if [ -n "$cj" ]; then
+    h "cancelling existing worker $cj on $node"
+    rsh "scancel $cj"; sleep 8
+  fi
+  h "submitting $(basename "$script") on $node with --mem=$mem"
+  rsh "cd /data/llm && sbatch --parsable --nodelist=$node --mem=$mem $script"
+  sleep 15
+  jobs_table
+}
+
+cmd_models() {
+  timeout 15 curl -s --max-time 10 "$ENDPOINT/models" 2>/dev/null |
+    python3 -c "import sys,json;[print(' ',m['id']) for m in json.load(sys.stdin).get('data',[])]" \
+    || echo "  (endpoint down)"
+}
+
+cmd_logs() {
+  local n="${1:-40}" rj; rj=$(job_id_by_name llm-router)
+  [ -n "$rj" ] || die "no running router"
+  rsh "tail -$n /data/llm/logs/router-$rj.out"
+}
+
+case "${1:-status}" in
+  status)     cmd_status ;;
+  restart)    shift; cmd_restart "$@" ;;
+  worker-mem) shift; cmd_worker_mem "$@" ;;
+  models)     cmd_models ;;
+  logs)       shift; cmd_logs "$@" ;;
+  *) die "unknown command '${1}'. Use: status | restart | worker-mem | models | logs" ;;
+esac

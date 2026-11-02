@@ -1,0 +1,9 @@
+[Unit]
+Description=Hourly: attach the slerm-yield hookscript to new VMs
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+
+[Install]
+WantedBy=timers.target

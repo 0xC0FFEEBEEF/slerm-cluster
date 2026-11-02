@@ -1,0 +1,6 @@
+# 2026-10-13 (user: "if theres any other better ones download them too"; download only, no config until we talk).
+# Swift 1.5 = UkisAI post-trained Qwen3.8-27B (same qwen35 arch as the qwen3.8-27b already served). Its card, five
+# seeds, same harness: Terminal-Bench 2.1 72.13% vs 69.21% for stock Qwen3.8-27B, with far fewer thinking tokens.
+# Q4_K_M matches the memory shape of the stock 27B preset (UD-Q4_K_XL, 16.4 GiB); Q5_K_M (19.5 GiB) also exists.
+ukisai/Swift-1.5-Qwen3.8-27B-GGUF|mmproj-Swift-1.5-Qwen3.8-27B-F16.gguf|swift-1.5-qwen3.8-27b-mmproj-f16.gguf|0
+ukisai/Swift-1.5-Qwen3.8-27B-GGUF|Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf|swift-1.5-qwen3.8-27b-q4km.gguf|0

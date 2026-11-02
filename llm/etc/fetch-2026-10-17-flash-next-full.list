@@ -1,0 +1,7 @@
+# 2026-10-17 (user picked "Both IQ2_XS and IQ3_XXS"): the FULL Qwen3.8-Flash-Next (177B, all 512 experts), ISTA-DASLab
+# GSQ-RCO, for Strata. Shard 1 only: shard 2 (the 28.8 GB n-gram table, sha256 316b46f3...) is byte-identical to the
+# Coder shard 2 already in models/qwen3.8-flash-next-coder/ and is hard-linked in instead of downloaded.
+# sha256: IQ2_XS 92cee27ae5bbadcd732416a0f7a7f0acc092399dbbe8f5a5efa707c2ec0a49d7
+#         IQ3_XXS 219ea929900dfa9ef091f3aa473fdba6874b65fcb36526d7d851ac9e95856d15
+ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF|IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf|qwen3.8-flash-next/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf|39225954592
+ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF|IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf|qwen3.8-flash-next/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf|47039860096

@@ -1,0 +1,9 @@
+#!/bin/bash
+# Forced command for byteme2 root key "slerm-ups-push" (authorized_keys:
+# restrict,from="byteme2"). stdin = one small JSON object from
+# /usr/local/sbin/slerm-ups-push on byteme2; relayed to slerm-orch /ups.
+# authorized_keys is on the NFS home shared by every node; only the head runs
+# the orchestrator, so anywhere else this is a no-op.
+case "$(hostname)" in slerm-head*) ;; *) exit 0 ;; esac
+exec curl -s -m 10 -X POST -H "Content-Type: application/json" \
+     --data-binary @<(head -c 4096) http://127.0.0.1:8091/ups

@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>slerm panel</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <meta name="theme-color" content="#000000">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🛰️</text></svg>">
+</head>
+<body>
+  <header class="top" id="top">
+    <div class="labnav" id="labnav">
+      <button class="labnav-btn" id="labnav-btn" aria-haspopup="true" aria-expanded="false" aria-controls="labnav-menu">
+        <h1>slerm<span>·</span>panel</h1>
+        <svg class="labnav-caret" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M3 4.5 6 7.5 9 4.5"/></svg>
+      </button>
+      <div class="labnav-menu" id="labnav-menu" role="menu" hidden>
+        <div class="labnav-head">Lab</div>
+        <a role="menuitem" class="labnav-item current" href="/" aria-current="page">
+          <span class="labnav-name">slerm panel</span><span class="labnav-sub">cluster · jobs · AI · slerm-head</span></a>
+        <a role="menuitem" class="labnav-item" href="http://byteme2:8787/">
+          <span class="labnav-name">Power</span><span class="labnav-sub">UPS · PSUs · energy · byteme2</span></a>
+        <a role="menuitem" class="labnav-item" href="http://pi:3000/dashboard">
+          <span class="labnav-name">Proxmox dashboard</span><span class="labnav-sub">hosts · VMs · lab telemetry · pi</span></a>
+        <a role="menuitem" class="labnav-item" href="http://psql:8790/">
+          <span class="labnav-name">Edge</span><span class="labnav-sub">Cloudflare · firewall · psql</span></a>
+      </div>
+    </div>
+    <span class="cluster-chip" id="cluster-chip">connecting…</span>
+    <nav class="tabs" id="tabs"><span class="tab-ind" id="tab-ind"></span></nav>
+    <span class="spacer"></span>
+    <span class="gw" id="gw" hidden><span class="dot ok" id="gw-dot"></span><span class="gw-txt" id="gw-txt">gateway</span><span class="gw-sub" id="gw-sub"></span></span>
+    <span id="refresh-state">—</span>
+  </header>
+
+  <main>
+    <!-- Cluster -->
+    <div class="view" id="view-cluster">
+      <div class="tiles" id="cluster-tiles"></div>
+
+      <section class="card">
+        <h2>Nodes <span class="muted" id="nodes-meta"></span>
+          <span class="h2-actions">
+            <button class="tiny" id="probe-all">Probe GPUs</button>
+          </span>
+        </h2>
+        <div class="idleclock" id="idle-clock" hidden>
+          <span>Idle <span class="num" id="ic-idle">—</span></span>
+          <div class="ic-track"><div class="ic-fill" id="ic-fill"></div>
+            <div class="ic-mark" id="ic-m1"><span id="ic-m1-t"></span></div>
+            <div class="ic-mark end" style="left:100%"><span id="ic-m2-t"></span></div></div>
+          <span id="ic-next"></span>
+        </div>
+        <div class="rows" id="node-grid"></div>
+      </section>
+
+      <div class="split">
+        <section class="card">
+          <h2>Queue <span class="muted" id="queue-meta"></span></h2>
+          <div class="table-wrap"><table id="queue-table"></table></div>
+        </section>
+
+        <section class="card">
+          <h2>Head node <span class="muted mono" id="head-name"></span></h2>
+          <div class="head-meters" id="head-tiles"></div>
+        </section>
+      </div>
+
+      <section class="card">
+        <h2>Recent jobs
+          <span class="h2-actions">
+            <select id="history-days" class="tiny">
+              <option value="1">last 24h</option>
+              <option value="3" selected>last 3 days</option>
+              <option value="7">last 7 days</option>
+              <option value="30">last 30 days</option>
+            </select>
+          </span>
+        </h2>
+        <div class="table-wrap"><table id="history-table"></table></div>
+      </section>
+    </div>
+
+    <!-- one view per registered project, built at runtime -->
+    <div id="project-views"></div>
+
+    <!-- AI -->
+    <div class="view" id="view-ai">
+      <section class="card">
+        <h2>Cluster model usage
+          <!-- Shown by CSS off #view-ai.live; no JS touches it. -->
+          <span class="ai-live-chip">inferencing</span>
+          <span class="h2-actions">
+            <span class="muted mono" id="ai-collecting"></span>
+            <select id="ai-window" class="tiny"></select>
+          </span>
+        </h2>
+        <div class="tiles" id="ai-tiles"></div>
+      </section>
+
+      <section class="card" id="ai-raw-card">
+        <h2>Live model I/O
+          <span class="h2-actions">
+            <span class="muted mono" id="ai-raw-state"></span>
+            <select id="ai-raw-pick" class="tiny"></select>
+            <label class="ai-raw-follow"><input type="checkbox" id="ai-raw-follow" checked> follow newest</label>
+          </span>
+        </h2>
+        <div id="ai-raw"></div>
+      </section>
+
+      <section class="card">
+        <h2>Inference servers
+          <span class="h2-actions">
+            <button class="tiny" id="ai-sample">Sample now</button>
+          </span>
+        </h2>
+        <div class="nodes" id="ai-servers"></div>
+        <div id="ai-strata"></div>
+      </section>
+
+      <section class="card">
+        <h2>Tokens over time
+          <span class="h2-actions muted mono" id="ai-series-label"></span>
+        </h2>
+        <div id="ai-series"></div>
+      </section>
+
+      <section class="card">
+        <h2>By model</h2>
+        <div class="table-wrap"><table id="ai-by-model"></table></div>
+      </section>
+
+      <section class="card">
+        <h2>Models on the cluster</h2>
+        <div class="table-wrap"><table id="ai-catalogue"></table></div>
+      </section>
+
+      <section class="card">
+        <h2>Shape of the load</h2>
+        <div class="ai-splits">
+          <div>
+            <h3>By answer length</h3>
+            <div class="table-wrap"><table id="ai-by-size"></table></div>
+          </div>
+          <div>
+            <h3>By node</h3>
+            <div class="table-wrap"><table id="ai-by-node"></table></div>
+          </div>
+          <div>
+            <h3>Model swaps</h3>
+            <div class="table-wrap"><table id="ai-events"></table></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Recent calls</h2>
+        <div class="table-wrap"><table id="ai-calls"></table></div>
+      </section>
+    </div>
+
+    <!-- Schedules -->
+    <div class="view" id="view-schedules">
+      <section class="card">
+        <h2>Add schedule</h2>
+        <div id="sched-notice"></div>
+        <form id="sched-form">
+          <div class="form-grid">
+            <div class="field">
+              <label>Project</label>
+              <select name="project" id="sched-project"></select>
+            </div>
+            <div class="field">
+              <label>Label</label>
+              <input name="label" placeholder="nightly KDGX">
+            </div>
+            <div class="field">
+              <label>Repeat</label>
+              <select name="kind" id="sched-kind">
+                <option value="cron">cron expression</option>
+                <option value="interval">every N seconds</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>Expression</label>
+              <input name="expr" id="sched-expr" value="0 6 * * *" placeholder="0 6 * * *">
+              <div class="help" id="sched-expr-help">min hour dom mon dow — 0 6 * * * is 06:00 daily</div>
+            </div>
+          </div>
+          <div class="form-grid" id="sched-params" style="margin-top:12px"></div>
+          <div style="margin-top:12px">
+            <button class="primary" type="submit">Add schedule</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="card">
+        <h2>Schedules <span class="h2-actions muted mono" id="sched-status"></span></h2>
+        <div class="table-wrap"><table id="sched-table"></table></div>
+      </section>
+    </div>
+  </main>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

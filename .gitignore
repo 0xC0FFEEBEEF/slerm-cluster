@@ -1,0 +1,21 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+node_modules/
+
+# secrets and state stay on the servers
+*.env
+*.key
+*.pem
+*.db
+*.db-*
+*.sqlite3*
+*.log
+*.pid
+
+# dated rollback copies
+*.bak*
+*.orig*
+*.before-*
+*.pre-*

@@ -1,0 +1,6 @@
+[Unit]
+Description=Attach the slerm-yield hookscript to non-slerm VMs
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/slerm-yield-ensure

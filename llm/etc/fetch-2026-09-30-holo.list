@@ -1,0 +1,8 @@
+# 2026-09-30: H Company Holo computer-use models (vision). 3.1-9B = GPU-only test now;
+# Holo4-35B-A3B = CPU-spill test now (node01/02 only), fast on the P100s; Holo4-27B = dense, P100s only.
+prithivMLmods/Holo-3.1-9B-GGUF|Holo-3.1-9B.Q4_K_M.gguf|holo-3.1-9b-q4km.gguf|0
+prithivMLmods/Holo-3.1-9B-GGUF|Holo-3.1-9B.mmproj-f16.gguf|holo-3.1-9b-mmproj-f16.gguf|0
+Hcompany/Holo4-35B-A3B-GGUF|mmproj.f16.gguf|holo4-35b-a3b-mmproj-f16.gguf|0
+Hcompany/Holo4-35B-A3B-GGUF|q4_k_m.gguf|holo4-35b-a3b-q4km.gguf|0
+Hcompany/Holo4-27B-GGUF|mmproj.f16.gguf|holo4-27b-mmproj-f16.gguf|0
+Hcompany/Holo4-27B-GGUF|q4_k_m.gguf|holo4-27b-q4km.gguf|0

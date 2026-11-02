@@ -1,0 +1,18 @@
+#!/bin/bash
+# Attach the slerm-yield hookscript to every VM on this host that is not a
+# slerm VM and has no hookscript of its own. Runs hourly, so VMs created later
+# are covered too. Never replaces someone else's hookscript.
+set -u
+case "$(hostname -s)" in
+    byteme)  STORE=local-btrfs; SLERM="300 303 304" ;;
+    byteme2) STORE=local;       SLERM="301 302" ;;
+    *) exit 0 ;;
+esac
+HOOK="$STORE:snippets/slerm-yield.sh"
+for conf in /etc/pve/qemu-server/*.conf; do
+    id=$(basename "$conf" .conf)
+    case " $SLERM " in *" $id "*) continue ;; esac
+    cur=$(awk -F': ' '$1 == "hookscript" { print $2 }' "$conf")
+    [ -n "$cur" ] && continue
+    qm set "$id" --hookscript "$HOOK" >/dev/null && echo "$(date -Is) hookscript attached to VM $id" >> /var/log/slerm-yield.log
+done

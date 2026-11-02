@@ -1,0 +1,4 @@
+# 2026-09-29: 9B qwen35 fine-tunes that fit the two current GPUs (target >= 20 tok/s)
+bartowski/Ornith-1.5-9B-GGUF|Ornith-1.5-9B-Q4_K_M.gguf|ornith-1.5-9b-q4km.gguf|5910782848
+bartowski/UI-Venus-2-9B-GGUF|UI-Venus-2-9B-Q4_K_M.gguf|ui-venus-2-9b-q4km.gguf|5910782752
+bartowski/UI-Venus-2-9B-GGUF|mmproj-UI-Venus-2-9B-f16.gguf|ui-venus-2-9b-mmproj-f16.gguf|918165664

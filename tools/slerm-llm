@@ -1,0 +1,127 @@
+#!/bin/bash
+# Desktop-side control + client for LLM inference on the slerm GPU nodes.
+#
+# Slurm commands go over ssh to slerm-head; inference goes straight to the GPU
+# node, which the desktop can reach directly even though the head cannot.
+set -uo pipefail
+
+NODE_TURING=slerm-node03      # slerm-node03, GTX 1660 SUPER
+NODE_MAXWELL=slerm-node04     # slerm-node04, GTX 980 Ti
+PORT=8080
+HEAD=slerm-head
+
+_healthy() { curl -sf -m 2 "http://$1:$PORT/health" >/dev/null 2>&1; }
+
+# firewalld on the Rocky nodes blocks 8080 from outside, and slerm has no sudo
+# there to open it (see README: "Opening the firewall"). Until that is done,
+# fall back to an SSH tunnel, which needs no privileges. Direct is preferred and
+# is what you get automatically once the port is open.
+_local_port() { [ "$1" = "$NODE_TURING" ] && echo 18080 || echo 18081; }
+_ssh_host()   { [ "$1" = "$NODE_TURING" ] && echo slerm-node03 || echo slerm-node04; }
+
+_tunnel() {
+  local ip=$1 lp host
+  lp=$(_local_port "$ip"); host=$(_ssh_host "$ip")
+  curl -sf -m 2 "http://127.0.0.1:$lp/health" >/dev/null 2>&1 && { echo "$lp"; return 0; }
+  ssh -f -N -o BatchMode=yes -o ExitOnForwardFailure=yes \
+      -o ServerAliveInterval=30 -L "$lp:127.0.0.1:$PORT" "$host" 2>/dev/null || return 1
+  curl -sf --retry 6 --retry-all-errors --retry-delay 1 -m 10 \
+       "http://127.0.0.1:$lp/health" >/dev/null 2>&1 || return 1
+  echo "$lp"
+}
+
+# First endpoint that answers, preferring the faster Turing card. Tries the
+# direct route first, then a tunnel.
+_endpoint() {
+  for ip in "$NODE_TURING" "$NODE_MAXWELL"; do
+    _healthy "$ip" && { echo "http://$ip:$PORT"; return 0; }
+  done
+  for ip in "$NODE_TURING" "$NODE_MAXWELL"; do
+    local lp
+    lp=$(_tunnel "$ip") && { echo "http://127.0.0.1:$lp"; return 0; }
+  done
+  return 1
+}
+
+cmd=${1:-status}; shift 2>/dev/null || true
+
+case "$cmd" in
+  status)
+    for pair in "node03/turing:$NODE_TURING" "node04/maxwell:$NODE_MAXWELL"; do
+      name=${pair%%:*}; ip=${pair##*:}
+      if _healthy "$ip"; then
+        printf "  %-16s UP        http://%s:%s/v1\n" "$name" "$ip" "$PORT"
+      elif lp=$(_tunnel "$ip"); then
+        printf "  %-16s UP(ssh)   http://127.0.0.1:%s/v1   [firewalld blocks :%s]\n" \
+               "$name" "$lp" "$PORT"
+      else
+        printf "  %-16s down\n" "$name"
+      fi
+    done
+    echo "--- slurm ---"
+    ssh -o BatchMode=yes "$HEAD" 'squeue -o "%.8i %.12j %.9P %.8T %.10M %.20R %b" | grep -E "JOBID|llm-" || echo "  no llm jobs"'
+    ;;
+
+  url) _endpoint || { echo "no endpoint up" >&2; exit 1; } ;;
+
+  up)
+    gres=${1:-turing}
+    ssh -o BatchMode=yes "$HEAD" "sbatch --gres=gpu:$gres:1 /data/llm/jobs/server.sh"
+    ;;
+
+  down)
+    ssh -o BatchMode=yes "$HEAD" 'scancel --name=llm-server --me && echo "cancelled llm-server jobs"'
+    ;;
+
+  chat)
+    base=$(_endpoint) || { echo "no endpoint up; try: slerm-llm up" >&2; exit 1; }
+    prompt="$*"
+    [ -z "$prompt" ] && prompt=$(cat)
+    python3 - "$base" "$prompt" <<'PY'
+import json, sys, urllib.request
+base, prompt = sys.argv[1], sys.argv[2]
+req = urllib.request.Request(
+    base + "/v1/chat/completions",
+    data=json.dumps({"messages": [{"role": "user", "content": prompt}],
+                     "max_tokens": 1024, "stream": True}).encode(),
+    headers={"Content-Type": "application/json"})
+with urllib.request.urlopen(req, timeout=600) as r:
+    for raw in r:
+        line = raw.decode().strip()
+        if not line.startswith("data: "):
+            continue
+        body = line[6:]
+        if body == "[DONE]":
+            break
+        try:
+            delta = json.loads(body)["choices"][0]["delta"].get("content")
+        except (ValueError, KeyError, IndexError):
+            continue
+        if delta:
+            sys.stdout.write(delta); sys.stdout.flush()
+print()
+PY
+    ;;
+
+  batch)
+    ssh -o BatchMode=yes "$HEAD" "sbatch ${SLERM_LLM_SBATCH:-} /data/llm/jobs/batch.sh $*"
+    ;;
+
+  logs)
+    ssh -o BatchMode=yes "$HEAD" 'tail -n 40 $(ls -t /data/llm/logs/server-*.out | head -1)'
+    ;;
+
+  *)
+    cat <<USAGE
+usage: slerm-llm <command>
+
+  status            which endpoints are up + llm jobs in the queue
+  up [turing|maxwell]   start a persistent server on that card (default turing)
+  down              cancel your llm-server jobs
+  url               base URL of the live endpoint (for other tools)
+  chat "prompt"     one-shot streaming chat against the live endpoint
+  batch IN OUT      sbatch an offline run over a prompt file
+  logs              tail the newest server job log
+USAGE
+    exit 1 ;;
+esac

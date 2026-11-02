@@ -1,0 +1,114 @@
+{
+ "_about": "STRATA-* models in the slerm model picker (2026-10-17). slerm-orch lists an entry when every file in 'requires' exists, and serves it with jobs/strata.sh (one Strata server on node04's two P100s, port below) instead of the llama.cpp router. 'config' = the Strata run config; warm_before/warm_after = files (or {file, offset, length} ranges) read into the page cache before the start / after READY. ctx, vision and reasoning_effort are what the gateway advertises in /v1/models.",
+ "port": 18100,
+ "models": {
+  "STRATA-qwen3.8-flash-next-coder": {
+   "label": "Qwen3.8-Flash-Next Coder (ISTA, 256 of 512 experts) on Strata: hot experts on the P100s, MTP drafts",
+   "config": "/data/llm/strata/configs/coder-iq1_m.json",
+   "ctx": 131072,
+   "vision": true,
+   "reasoning_effort": "medium",
+   "ready_s": 2400,
+   "warm_before": [
+    "/data/llm/strata/data/packs/coder-iq1_m-eb/experts.bin"
+   ],
+   "warm_after": [
+    {
+     "file": "/data/llm/models/qwen3.8-flash-next-coder.gguf",
+     "offset": 29608450592,
+     "length": 28800138240
+    }
+   ],
+   "requires": [
+    "/data/llm/strata/Strata/engine-cuda12/strata",
+    "/data/llm/strata/Strata/engine-cuda12/strata-vision",
+    "/data/llm/strata/configs/coder-iq1_m.json",
+    "/data/llm/strata/data/packs/coder-iq1_m-eb/experts.bin"
+   ],
+   "drop_before": [
+    "/data/llm/models/qwen3.8-flash-next-coder/qwen3.8-flash-next-coder-00001-of-00002.gguf",
+    "/data/llm/strata/data/packs/iq2_xs-eb/experts.bin",
+    "/data/llm/models/qwen3.8-flash-next/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf",
+    "/data/llm/strata/data/packs/iq3_xxs-eb/experts.bin",
+    "/data/llm/models/qwen3.8-flash-next/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf"
+   ]
+  },
+  "STRATA-qwen3.8-flash-next-iq2xs": {
+   "label": "Qwen3.8-Flash-Next IQ2_XS, the FULL 177B model (all 512 experts; ISTA GSQ-RCO, avg score 89.2 vs 93.1 BF16) on Strata",
+   "config": "/data/llm/strata/configs/iq2_xs.json",
+   "ctx": 131072,
+   "vision": true,
+   "reasoning_effort": "medium",
+   "ready_s": 2400,
+   "warm_before": [
+    "/data/llm/strata/data/packs/iq2_xs-eb/experts.bin"
+   ],
+   "warm_after": [
+    {
+     "file": "/data/llm/models/qwen3.8-flash-next-coder.gguf",
+     "offset": 29608450592,
+     "length": 28800138240
+    }
+   ],
+   "requires": [
+    "/data/llm/strata/configs/iq2_xs.json",
+    "/data/llm/models/qwen3.8-flash-next/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf",
+    "/data/llm/models/qwen3.8-flash-next/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf",
+    "/data/llm/strata/data/packs/iq2_xs-eb/experts.bin",
+    "/data/llm/strata/data/packs/iq2_xs-eb/native_experts.txt",
+    "/data/llm/strata/data/packs/iq2_xs-eb/tokenizer/vocab.json",
+    "/data/llm/strata/Strata/engine-cuda12/strata",
+    "/data/llm/strata/Strata/engine-cuda12/strata-vision"
+   ],
+   "drop_before": [
+    "/data/llm/models/qwen3.8-flash-next/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf",
+    "/data/llm/strata/data/packs/coder-iq1_m-eb/experts.bin",
+    "/data/llm/models/qwen3.8-flash-next-coder/qwen3.8-flash-next-coder-00001-of-00002.gguf",
+    "/data/llm/strata/data/packs/iq3_xxs-eb/experts.bin",
+    "/data/llm/models/qwen3.8-flash-next/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf"
+   ]
+  },
+  "STRATA-qwen3.8-flash-next-iq3xxs": {
+   "label": "Qwen3.8-Flash-Next IQ3_XXS, the FULL 177B model (all 512 experts; ISTA GSQ-RCO, avg score 92.6 vs 93.1 BF16) on Strata",
+   "config": "/data/llm/strata/configs/iq3_xxs.json",
+   "ctx": 131072,
+   "vision": true,
+   "reasoning_effort": "medium",
+   "ready_s": 2400,
+   "warm_before": [
+    "/data/llm/strata/data/packs/iq3_xxs-eb/experts.bin"
+   ],
+   "warm_after": [
+    {
+     "file": "/data/llm/models/qwen3.8-flash-next-coder.gguf",
+     "offset": 29608450592,
+     "length": 28800138240
+    }
+   ],
+   "requires": [
+    "/data/llm/strata/configs/iq3_xxs.json",
+    "/data/llm/models/qwen3.8-flash-next/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+    "/data/llm/models/qwen3.8-flash-next/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf",
+    "/data/llm/strata/data/packs/iq3_xxs-eb/experts.bin",
+    "/data/llm/strata/data/packs/iq3_xxs-eb/native_experts.txt",
+    "/data/llm/strata/data/packs/iq3_xxs-eb/tokenizer/vocab.json",
+    "/data/llm/strata/Strata/engine-cuda12/strata",
+    "/data/llm/strata/Strata/engine-cuda12/strata-vision"
+   ],
+   "drop_before": [
+    "/data/llm/models/qwen3.8-flash-next/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+    "/data/llm/strata/data/packs/coder-iq1_m-eb/experts.bin",
+    "/data/llm/models/qwen3.8-flash-next-coder/qwen3.8-flash-next-coder-00001-of-00002.gguf",
+    "/data/llm/strata/data/packs/iq2_xs-eb/experts.bin",
+    "/data/llm/models/qwen3.8-flash-next/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf"
+   ]
+  }
+ },
+ "_about_local_copies": "NFS path -> copy on node04 (/ssd = the M.2 in byteme, 2026-10-17). jobs/strata.sh uses a copy only when it is complete (same size, every file of a directory); otherwise the NFS original. requires stays on NFS (checked on the head).",
+ "local_copies": {
+  "/data/llm/models/qwen3.8-flash-next-coder.gguf": "/ssd/strata/models/qwen3.8-flash-next-coder.gguf",
+  "/data/llm/strata/data/packs/iq2_xs-eb": "/ssd/strata/packs/iq2_xs-eb",
+  "/data/llm/strata/data/packs/coder-iq1_m-eb": "/ssd/strata/packs/coder-iq1_m-eb",
+  "/data/llm/strata/data/packs/iq3_xxs-eb": "/ssd/strata/packs/iq3_xxs-eb"
+ }
+}

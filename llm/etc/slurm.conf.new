@@ -1,0 +1,63 @@
+ClusterName=slerm
+SlurmctldHost=slerm-head
+GresTypes=gpu
+
+AccountingStorageType=accounting_storage/slurmdbd
+AccountingStorageHost=slerm-head
+AccountingStoragePort=6819
+JobAcctGatherType=jobacct_gather/cgroup
+JobAcctGatherFrequency=30
+
+PriorityType=priority/multifactor
+PriorityWeightFairshare=10000
+PriorityWeightAge=1000
+PriorityWeightPartition=1000
+PriorityWeightJobSize=1000
+PriorityDecayHalfLife=7-0
+AccountingStorageEnforce=associations,limits,qos
+
+SlurmUser=slurm
+SlurmdUser=root
+StateSaveLocation=/var/spool/slurmctld
+SlurmdSpoolDir=/var/spool/slurmd
+SlurmctldPidFile=/var/run/slurmctld.pid
+SlurmdPidFile=/var/run/slurmd.pid
+
+AuthType=auth/munge
+CredType=cred/munge
+
+ProctrackType=proctrack/cgroup
+TaskPlugin=task/cgroup,task/affinity
+
+SchedulerType=sched/backfill
+
+# Preemption: a job in a higher PriorityTier partition may evict one in a lower
+# tier. REQUEUE puts the evicted job back in the queue, so the long-running
+# inference server restarts by itself once the card is free again.
+PreemptType=preempt/partition_prio
+PreemptMode=REQUEUE
+SelectType=select/cons_tres
+SelectTypeParameters=CR_Core_Memory
+
+SlurmctldLogFile=/var/log/slurm/slurmctld.log
+SlurmdLogFile=/var/log/slurm/slurmd.log
+SlurmctldDebug=info
+SlurmdDebug=info
+
+ReturnToService=2
+
+NodeName=slerm-node[01-02] CPUs=16 Boards=1 SocketsPerBoard=1 CoresPerSocket=16 ThreadsPerCore=1 RealMemory=15729 State=UNKNOWN
+NodeName=slerm-node03 CPUs=6 Boards=1 SocketsPerBoard=1 CoresPerSocket=6 ThreadsPerCore=1 RealMemory=9614 Gres=gpu:turing:1 State=UNKNOWN
+NodeName=slerm-node04 CPUs=6 Boards=1 SocketsPerBoard=1 CoresPerSocket=6 ThreadsPerCore=1 RealMemory=9614 Gres=gpu:maxwell:1 State=UNKNOWN
+
+PartitionName=compute Nodes=slerm-node[01-02] Default=YES MaxTime=INFINITE State=UP DefMemPerCPU=900 PriorityTier=100
+PartitionName=gpu Nodes=slerm-node[03-04] MaxTime=INFINITE State=UP DefMemPerCPU=1500 PriorityTier=100
+
+# Same two nodes, deliberately overlapping. Long-running inference lives here at
+# the lowest tier so anything submitted to `gpu` can take the card back.
+# GraceTime lets llama-server shut down before it is killed.
+PartitionName=llm Nodes=slerm-node[03-04] MaxTime=INFINITE State=UP DefMemPerCPU=1500 PriorityTier=1 PreemptMode=REQUEUE GraceTime=30
+
+# Compute nodes carry the CPU RPC workers the same way: `compute` outranks
+# `llmcpu`, so a real compute job evicts a worker instead of queueing behind it.
+PartitionName=llmcpu Nodes=slerm-node[01-02] MaxTime=INFINITE State=UP DefMemPerCPU=900 PriorityTier=1 PreemptMode=REQUEUE GraceTime=30
